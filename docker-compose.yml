@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  zju-courses-auto-signin:
+    build: .
+    container_name: zju_courses_auto_signin
+    restart: unless-stopped
+    env_file:
+      - .env
