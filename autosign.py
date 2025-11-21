@@ -3,10 +3,47 @@ import re
 import asyncio
 import uuid
 import aiohttp
+import logging
+import sys
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
+from colorama import init, Fore, Style
 
+init(autoreset=True)
 load_dotenv()
+
+
+class ColoredFormatter(logging.Formatter):
+    COLORS = {
+        logging.DEBUG: Fore.CYAN + Style.DIM,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
+        logging.CRITICAL: Fore.RED + Style.BRIGHT,
+    }
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, Fore.WHITE)
+        
+        log_fmt = (
+            f"{Fore.LIGHTBLACK_EX}%(asctime)s{Style.RESET_ALL} "
+            f"{color}[%(levelname)s]{Style.RESET_ALL} "
+            f"%(message)s"
+        )
+        
+        formatter = logging.Formatter(log_fmt, datefmt="%H:%M:%S")
+        return formatter.format(record)
+
+def setup_logger():
+    logger = logging.getLogger("ZJU_Auto")
+    logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(ColoredFormatter())
+    logger.addHandler(handler)
+    return logger
+
+logger = setup_logger()
 
 def rsa_encrypt(password: str, exponent: str, modulus: str) -> str:
     password_bytes = password.encode('ascii')
@@ -36,7 +73,7 @@ class ZJUAM:
         await self.session.close()
 
     async def _login(self, login_url: str):
-        print("[ZJUAM] Attempting login …")
+        logger.info(f"ZJUAM: Attempting login as {Fore.CYAN}{self.username}{Style.RESET_ALL}...")
 
         async with self.session.get(login_url) as r:
             html = await r.text()
@@ -62,7 +99,7 @@ class ZJUAM:
         async with self.session.post(login_url, data=data, headers=HEADERS, allow_redirects=False) as r:
             if r.status == 302:
                 self.first_login = True
-                print("[ZJUAM] Login success.")
+                logger.info("ZJUAM: Login success.")
                 return r.headers.get("Location")
 
             if r.status == 200:
@@ -101,7 +138,7 @@ class COURSES:
         await self.session.close()
 
     async def login(self):
-        print("[COURSES] login begins")
+        logger.info("Courses: Login sequence started.")
         url = "https://courses.zju.edu.cn/user/index"
         
         current_url = url
@@ -120,18 +157,13 @@ class COURSES:
                 else:
                     current_url = location
 
-        print("[COURSES] Login finished.")
+        logger.info("Courses: Login finished.")
 
     async def fetch(self, url: str, method="GET", headers=HEADERS, **kwargs):
         if self.first:
             await self.login()
             self.first = False
         return await self.session.request(method, url, headers=headers, **kwargs)
-
-CONFIG = {
-    "raderAt": "ZJGD1",
-    "coldDownTime": 2
-}
 
 RaderInfo = {
     "ZJGD1": (120.089136, 30.302331),
@@ -148,6 +180,15 @@ RaderInfo = {
     "ZJG4":  (120.073427, 30.299757)
 }
 
+CONFIG = {
+    "raderAt": os.getenv("RADAR_AT", "ZJGD1"),
+    "coldDownTime": int(os.getenv("COLD_DOWN_TIME", "2")),
+}
+
+if CONFIG["raderAt"] not in RaderInfo:
+    logger.error(f"Config Error: Unknown radar location '{CONFIG['raderAt']}'. Please check RADAR_AT environment variable.")
+    sys.exit(1)
+
 async def answer_radar(courses: COURSES, xy, rid):
     async def _req(x, y):
         payload = {
@@ -160,7 +201,6 @@ async def answer_radar(courses: COURSES, xy, rid):
             "altitudeAccuracy": None,
             "heading": None,
         }
-        
         try:
             async with await courses.fetch(
                 f"https://courses.zju.edu.cn/api/rollcall/{rid}/answer?api_version=1.1.2",
@@ -168,23 +208,23 @@ async def answer_radar(courses: COURSES, xy, rid):
                 json=payload
             ) as r:
                 return await r.json()
-        except:
+        except Exception:
             return None
 
-    print("[Radar] Trying configured radar point:", xy)
+    logger.info(f"Radar: Trying default point {Fore.BLUE}{CONFIG['raderAt']}{Style.RESET_ALL}...")
     res = await _req(xy[0], xy[1])
     if res and res.get("status_name") == "on_call_fine":
-        print("[Radar] Success at configured point!")
+        logger.info(f"Radar: {Fore.GREEN}Success at configured point!{Style.RESET_ALL}")
         return True
 
-    print("[Radar] Trying all Rader points...")
+    logger.info("Radar: Trying all known locations...")
     for key, (x, y) in RaderInfo.items():
         res = await _req(x, y)
         if res and res.get("status_name") == "on_call_fine":
-            print("[Radar] Success at:", key)
+            logger.info(f"Radar: {Fore.GREEN}Success at {key}!{Style.RESET_ALL}")
             return True
 
-    print("[Radar] All locations failed.")
+    logger.warning("Radar: All locations failed.")
     return False
 
 async def answer_number(courses: COURSES, rid, code):
@@ -204,7 +244,7 @@ async def answer_number(courses: COURSES, rid, code):
         return data.get("status") == "on_call"
 
 async def brute_force_number(courses: COURSES, rid):
-    print(f"[Bruteforce] cracking rollcall #{rid}")
+    logger.info(f"Bruteforce: Cracking rollcall #{rid}...")
     
     sem = asyncio.Semaphore(50)
     found_event = asyncio.Event()
@@ -220,7 +260,7 @@ async def brute_force_number(courses: COURSES, rid):
             if success:
                 result_code = code
                 found_event.set()
-                print(f"[Bruteforce] SUCCESS! code = {code}")
+                logger.info(f"Bruteforce: {Fore.GREEN}SUCCESS! Code = {code}{Style.RESET_ALL}")
 
     tasks = []
     for i in range(10000):
@@ -233,7 +273,7 @@ async def brute_force_number(courses: COURSES, rid):
     if result_code:
         return result_code
     
-    print("[Bruteforce] Failed: no code found.")
+    logger.warning("Bruteforce: Failed to find code.")
     return None
 
 async def main():
@@ -241,7 +281,7 @@ async def main():
     pwd = os.getenv("ZJU_PASSWORD")
 
     if not user or not pwd:
-        print("请设置环境变量 ZJU_USERNAME 与 ZJU_PASSWORD")
+        logger.error("请设置环境变量 ZJU_USERNAME 与 ZJU_PASSWORD")
         return
 
     am = ZJUAM(user, pwd)
@@ -256,7 +296,8 @@ async def main():
 
                 rollcalls = data.get("rollcalls", [])
                 if not rollcalls:
-                    print(f"[Auto Sign-in #{req_num}] No rollcalls.")
+                    # DEBUG 级别，平时不显示，防止刷屏
+                    logger.debug(f"Auto Sign-in #{req_num}: No rollcalls.")
                     req_num += 1
                     await asyncio.sleep(CONFIG["coldDownTime"])
                     continue
@@ -267,36 +308,29 @@ async def main():
                     course = rc.get("course_title")
                     status_name = rc.get("status_name")
                     status = rc.get("status")
-                    created_by_name = rc.get("created_by_name")
-                    department = rc.get("department_name")
-
-                    print(f"\n[Found] {title} @ {course}  by  {created_by_name} ({department})")
-                    print(f"[Rollcall Info] rid={rid}, status={status}, status_name={status_name}, "
-                          f"is_radar={rc.get('is_radar')}, is_number={rc.get('is_number')}")
+                    created_by = rc.get("created_by_name")
+                    
+                    # 发现新点名，使用亮色显示重要信息
+                    logger.info(f"{Fore.MAGENTA}FOUND:{Style.RESET_ALL} {title} @ {course} by {created_by}")
+                    logger.info(f"Meta: rid={rid}, status={status_name}, Radar={rc.get('is_radar')}, Number={rc.get('is_number')}")
 
                     if status_name in ("on_call_fine", "on_call") or status in ("on_call_fine", "on_call"):
-                        print(f"[Skip] Rollcall #{rid} 已签到（status_name={status_name}）")
+                        logger.warning(f"Skip: Rollcall #{rid} already signed in.")
                         await asyncio.sleep(CONFIG["coldDownTime"])
                         continue
                     
                     if rc.get("is_radar"):
-                        xy = RaderInfo[CONFIG["raderAt"]]
-                        print(f"[Radar] 开始尝试雷达点名: rid={rid}")
-                        ok = await answer_radar(courses, xy, rid)
-                        print(f"[Radar] 结果: {'成功' if ok else '失败'}")
+                        logger.info(f"Action: Starting Radar Sign-in for rid={rid}")
+                        await answer_radar(courses, RaderInfo[CONFIG["raderAt"]], rid)
 
                     if rc.get("is_number"):
-                        print(f"[Number] 开始破解点名 code: rid={rid}")
-                        code = await brute_force_number(courses, rid)
-                        if code:
-                            print(f"[Number] 点名成功！code = {code}")
-                        else:
-                            print("[Number] 未找到正确 code")
+                        logger.info(f"Action: Starting Number Crack for rid={rid}")
+                        await brute_force_number(courses, rid)
 
                     await asyncio.sleep(CONFIG["coldDownTime"])
 
-            except Exception as e:
-                print(f"[Error] {e}")
+            except Exception:
+                logger.exception("An error occurred in the monitoring loop")
                 await asyncio.sleep(5)
 
     finally:
