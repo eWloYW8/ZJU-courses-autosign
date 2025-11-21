@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import uuid
+import time
 import aiohttp
 import logging
 import sys
@@ -181,8 +182,11 @@ RaderInfo = {
 }
 
 CONFIG = {
+    "user": os.getenv("ZJU_USERNAME", ""),
+    "pwd": os.getenv("ZJU_PASSWORD", ""),
     "raderAt": os.getenv("RADAR_AT", "ZJGD1"),
     "coldDownTime": int(os.getenv("COLD_DOWN_TIME", "2")),
+    "reloginInterval": int(os.getenv("RELOGIN_INTERVAL", "3600")),
 }
 
 if CONFIG["raderAt"] not in RaderInfo:
@@ -277,26 +281,42 @@ async def brute_force_number(courses: COURSES, rid):
     return None
 
 async def main():
-    user = os.getenv("ZJU_USERNAME")
-    pwd = os.getenv("ZJU_PASSWORD")
-
-    if not user or not pwd:
+    if not CONFIG["user"] or not CONFIG["pwd"]:
         logger.error("请设置环境变量 ZJU_USERNAME 与 ZJU_PASSWORD")
         return
 
-    am = ZJUAM(user, pwd)
+    am = ZJUAM(CONFIG["user"], CONFIG["pwd"])
     courses = COURSES(am)
+
+    last_relogin_time = time.time()
 
     try:
         req_num = 0
         while True:
+            current_time = time.time()
+            if current_time - last_relogin_time > CONFIG["reloginInterval"]:
+                logger.info(f"{Fore.YELLOW}System: re-login interval reached. Re-initializing...{Style.RESET_ALL}")
+                try:
+                    if courses: await courses.close()
+                    if am: await am.close()
+
+                    am = ZJUAM(CONFIG["user"], CONFIG["pwd"])
+                    courses = COURSES(am)
+                    
+                    await courses.login()
+                    
+                    last_relogin_time = current_time
+                    logger.info(f"{Fore.GREEN}System: Session fully reset and re-logged in.{Style.RESET_ALL}")
+                except Exception as e:
+                    logger.error(f"System: Reset failed: {e}")
+                    await asyncio.sleep(10)
+
             try:
                 async with await courses.fetch("https://courses.zju.edu.cn/api/radar/rollcalls") as r:
                     data = await r.json()
 
                 rollcalls = data.get("rollcalls", [])
                 if not rollcalls:
-                    # DEBUG 级别，平时不显示，防止刷屏
                     logger.debug(f"Auto Sign-in #{req_num}: No rollcalls.")
                     req_num += 1
                     await asyncio.sleep(CONFIG["coldDownTime"])
@@ -310,7 +330,6 @@ async def main():
                     status = rc.get("status")
                     created_by = rc.get("created_by_name")
                     
-                    # 发现新点名，使用亮色显示重要信息
                     logger.info(f"{Fore.MAGENTA}FOUND:{Style.RESET_ALL} {title} @ {course} by {created_by}")
                     logger.info(f"Meta: rid={rid}, status={status_name}, Radar={rc.get('is_radar')}, Number={rc.get('is_number')}")
 
@@ -334,8 +353,8 @@ async def main():
                 await asyncio.sleep(5)
 
     finally:
-        await am.close()
-        await courses.close()
+        if am: await am.close()
+        if courses: await courses.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
