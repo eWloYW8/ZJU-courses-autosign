@@ -4,6 +4,9 @@ import asyncio
 import uuid
 import aiohttp
 from urllib.parse import urlparse, parse_qs
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def rsa_encrypt(password: str, exponent: str, modulus: str) -> str:
     password_bytes = password.encode('ascii')
