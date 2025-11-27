@@ -9,10 +9,54 @@ import sys
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 from colorama import init, Fore, Style
+import hashlib
+import hmac
+import base64
+import urllib.parse
+import signal
 
 init(autoreset=True)
 load_dotenv()
+exit_event = asyncio.Event()
 
+CONFIG = {
+    "user": os.getenv("ZJU_USERNAME", ""),
+    "pwd": os.getenv("ZJU_PASSWORD", ""),
+    "raderAt": os.getenv("RADAR_AT", "ZJGD1"),
+    "coldDownTime": int(os.getenv("COLD_DOWN_TIME", "2")),
+    "reloginInterval": int(os.getenv("RELOGIN_INTERVAL", "3600")),
+    "DINGTALK_WEBHOOK": os.getenv("DINGTALK_WEBHOOK", ""),
+    "DINGTALK_SECRET": os.getenv("DINGTALK_SECRET", None),
+}
+
+async def ding_talk(msg: str):
+    if not CONFIG["DINGTALK_WEBHOOK"]:
+        logger.debug("DingTalk webhook not set.")
+        return
+
+    url = CONFIG["DINGTALK_WEBHOOK"]
+
+    if CONFIG["DINGTALK_SECRET"]:
+        timestamp = str(round(time.time() * 1000))
+        secret_enc = CONFIG["DINGTALK_SECRET"].encode('utf-8')
+        string_to_sign = f'{timestamp}\n{CONFIG["DINGTALK_SECRET"]}'
+        string_to_sign_enc = string_to_sign.encode('utf-8')
+        hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+        url = f"{url}&timestamp={timestamp}&sign={sign}"
+
+    body = {
+        "msgtype": "text",
+        "text": {"content": msg}
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, json=body) as r:
+                if r.status != 200:
+                    logger.error(f"DingTalk: Failed to send message: {await r.text()}")
+        except Exception as e:
+            logger.error(f"DingTalk: Error sending message: {e}")
 
 class ColoredFormatter(logging.Formatter):
     COLORS = {
@@ -181,14 +225,6 @@ RaderInfo = {
     "ZJG4":  (120.073427, 30.299757)
 }
 
-CONFIG = {
-    "user": os.getenv("ZJU_USERNAME", ""),
-    "pwd": os.getenv("ZJU_PASSWORD", ""),
-    "raderAt": os.getenv("RADAR_AT", "ZJGD1"),
-    "coldDownTime": int(os.getenv("COLD_DOWN_TIME", "2")),
-    "reloginInterval": int(os.getenv("RELOGIN_INTERVAL", "3600")),
-}
-
 if CONFIG["raderAt"] not in RaderInfo:
     logger.error(f"Config Error: Unknown radar location '{CONFIG['raderAt']}'. Please check RADAR_AT environment variable.")
     sys.exit(1)
@@ -226,9 +262,11 @@ async def answer_radar(courses: COURSES, xy, rid):
         res = await _req(x, y)
         if res and res.get("status_name") == "on_call_fine":
             logger.info(f"Radar: {Fore.GREEN}Success at {key}!{Style.RESET_ALL}")
+            await ding_talk(f"雷达点名成功（rid={rid}）")
             return True
 
     logger.warning("Radar: All locations failed.")
+    await ding_talk(f"雷达点名失败（rid={rid}）")
     return False
 
 async def answer_number(courses: COURSES, rid, code):
@@ -265,6 +303,7 @@ async def brute_force_number(courses: COURSES, rid):
                 result_code = code
                 found_event.set()
                 logger.info(f"Bruteforce: {Fore.GREEN}SUCCESS! Code = {code}{Style.RESET_ALL}")
+                await ding_talk(f"数字点名破解成功（rid={rid}），验证码为：{code}")
 
     tasks = []
     for i in range(10000):
@@ -278,7 +317,23 @@ async def brute_force_number(courses: COURSES, rid):
         return result_code
     
     logger.warning("Bruteforce: Failed to find code.")
+    await ding_talk(f"数字点名破解失败（rid={rid}）")
     return None
+
+def setup_signal_handlers(loop):
+    def handler(signame):
+        print(f"[System] Received {signame}, quitting...")
+
+        exit_event.set()
+
+        loop.create_task(
+            ding_talk(f"⚠️ 程序收到信号：{signame}，准备退出")
+        )
+
+    for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signame)
+        loop.add_signal_handler(signum, lambda s=signame: handler(s))
+
 
 async def main():
     if not CONFIG["user"] or not CONFIG["pwd"]:
@@ -288,11 +343,15 @@ async def main():
     am = ZJUAM(CONFIG["user"], CONFIG["pwd"])
     courses = COURSES(am)
 
+    await courses.login()
+
+    await ding_talk("ZJU-courses-autosign 已登录")
+
     last_relogin_time = time.time()
 
     try:
         req_num = 0
-        while True:
+        while not exit_event.is_set():
             current_time = time.time()
             if current_time - last_relogin_time > CONFIG["reloginInterval"]:
                 logger.info(f"{Fore.YELLOW}System: re-login interval reached. Re-initializing...{Style.RESET_ALL}")
@@ -309,6 +368,7 @@ async def main():
                     logger.info(f"{Fore.GREEN}System: Session fully reset and re-logged in.{Style.RESET_ALL}")
                 except Exception as e:
                     logger.error(f"System: Reset failed: {e}")
+                    await ding_talk(f"系统重置失败：{e}")
                     await asyncio.sleep(10)
 
             try:
@@ -338,6 +398,8 @@ async def main():
                         await asyncio.sleep(CONFIG["coldDownTime"])
                         continue
                     
+                    await ding_talk(f"发现未完成点名：{title}（课程：{course}，创建者：{created_by}）")
+                    
                     if rc.get("is_radar"):
                         logger.info(f"Action: Starting Radar Sign-in for rid={rid}")
                         await answer_radar(courses, RaderInfo[CONFIG["raderAt"]], rid)
@@ -357,4 +419,11 @@ async def main():
         if courses: await courses.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    setup_signal_handlers(loop)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
+        print("[System] Event loop closed.")
