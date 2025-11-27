@@ -49,8 +49,9 @@ async def ding_talk(body):
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(url, json=body) as r:
-                if r.status != 200:
-                    logger.error(f"DingTalk: Failed to send message: {await r.text()}")
+                response_json = await r.json()
+                if response_json.get("errcode", 0) != 0:
+                    logger.error(f"DingTalk: Failed to send message: {response_json.get('errmsg')}")
         except Exception as e:
             logger.error(f"DingTalk: Error sending message: {e}")
 
