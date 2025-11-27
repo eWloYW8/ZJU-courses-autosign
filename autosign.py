@@ -14,6 +14,7 @@ import hmac
 import base64
 import urllib.parse
 import signal
+import traceback
 
 init(autoreset=True)
 load_dotenv()
@@ -29,7 +30,7 @@ CONFIG = {
     "DINGTALK_SECRET": os.getenv("DINGTALK_SECRET", None),
 }
 
-async def ding_talk(msg: str):
+async def ding_talk(body):
     if not CONFIG["DINGTALK_WEBHOOK"]:
         logger.debug("DingTalk webhook not set.")
         return
@@ -45,11 +46,6 @@ async def ding_talk(msg: str):
         sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
         url = f"{url}&timestamp={timestamp}&sign={sign}"
 
-    body = {
-        "msgtype": "text",
-        "text": {"content": msg}
-    }
-
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(url, json=body) as r:
@@ -57,6 +53,23 @@ async def ding_talk(msg: str):
                     logger.error(f"DingTalk: Failed to send message: {await r.text()}")
         except Exception as e:
             logger.error(f"DingTalk: Error sending message: {e}")
+
+async def ding_talk_string(msg: str):
+    body = {
+        "msgtype": "text",
+        "text": {"content": msg}
+    }
+    await ding_talk(body)
+
+async def ding_talk_markdown(title: str, text: str):
+    body = {
+        "msgtype": "markdown",
+        "markdown": {
+            "title": title,
+            "text": text
+        }
+    }
+    await ding_talk(body)
 
 class ColoredFormatter(logging.Formatter):
     COLORS = {
@@ -262,11 +275,11 @@ async def answer_radar(courses: COURSES, xy, rid):
         res = await _req(x, y)
         if res and res.get("status_name") == "on_call_fine":
             logger.info(f"Radar: {Fore.GREEN}Success at {key}!{Style.RESET_ALL}")
-            await ding_talk(f"雷达点名成功（rid={rid}）")
+            await ding_talk_markdown("✅AutoSign Success", f"[AutoSign] ✅ Congratulations! Radar sign-in succeeded at {key} (rid={rid})")
             return True
 
     logger.warning("Radar: All locations failed.")
-    await ding_talk(f"雷达点名失败（rid={rid}）")
+    await ding_talk_markdown("❌AutoSign Failure", f"[AutoSign] ❌ Radar sign-in failed (rid={rid})")
     return False
 
 async def answer_number(courses: COURSES, rid, code):
@@ -303,7 +316,7 @@ async def brute_force_number(courses: COURSES, rid):
                 result_code = code
                 found_event.set()
                 logger.info(f"Bruteforce: {Fore.GREEN}SUCCESS! Code = {code}{Style.RESET_ALL}")
-                await ding_talk(f"数字点名破解成功（rid={rid}），验证码为：{code}")
+                await ding_talk_markdown("✅AutoSign Success", f"[AutoSign] ✅ Number rollcall brute force succeeded (rid={rid}), code: {code}")
 
     tasks = []
     for i in range(10000):
@@ -317,7 +330,7 @@ async def brute_force_number(courses: COURSES, rid):
         return result_code
     
     logger.warning("Bruteforce: Failed to find code.")
-    await ding_talk(f"数字点名破解失败（rid={rid}）")
+    await ding_talk_markdown("❌AutoSign Failure", f"[AutoSign] ❌ Number rollcall brute force failed (rid={rid})")
     return None
 
 def setup_signal_handlers(loop):
@@ -327,7 +340,7 @@ def setup_signal_handlers(loop):
         exit_event.set()
 
         loop.create_task(
-            ding_talk(f"⚠️ 程序收到信号：{signame}，准备退出")
+            ding_talk_markdown("⚠️AutoSign Warning", f"[AutoSign] ⚠️ Program received signal: {signame}, preparing to exit")
         )
 
     for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
@@ -345,7 +358,7 @@ async def main():
 
     await courses.login()
 
-    await ding_talk("ZJU-courses-autosign 已登录")
+    await ding_talk_markdown("✅AutoSign Success", "[AutoSign] ✅ Logged in as " + CONFIG["user"])
 
     last_relogin_time = time.time()
 
@@ -368,7 +381,7 @@ async def main():
                     logger.info(f"{Fore.GREEN}System: Session fully reset and re-logged in.{Style.RESET_ALL}")
                 except Exception as e:
                     logger.error(f"System: Reset failed: {e}")
-                    await ding_talk(f"系统重置失败：{e}")
+                    await ding_talk_markdown("❌AutoSign Failure", f"[AutoSign] ❌ System reset failed: {e}")
                     await asyncio.sleep(10)
 
             try:
@@ -398,20 +411,25 @@ async def main():
                         await asyncio.sleep(CONFIG["coldDownTime"])
                         continue
                     
-                    await ding_talk(f"发现未完成点名：{title}（课程：{course}，创建者：{created_by}）")
-                    
                     if rc.get("is_radar"):
+                        await ding_talk_markdown("AutoSign Info", f"[AutoSign] Found radar rollcall: {title} @ {course} by {created_by} (rid={rid})")
                         logger.info(f"Action: Starting Radar Sign-in for rid={rid}")
                         await answer_radar(courses, RaderInfo[CONFIG["raderAt"]], rid)
 
                     if rc.get("is_number"):
+                        await ding_talk_markdown("AutoSign Info", f"[AutoSign] Found number rollcall: {title} @ {course} by {created_by} (rid={rid})")
                         logger.info(f"Action: Starting Number Crack for rid={rid}")
                         await brute_force_number(courses, rid)
+                    
+                    if not rc.get("is_radar") and not rc.get("is_number"):
+                        await ding_talk_markdown("AutoSign Info", f"[AutoSign] ❓ Found unknown type rollcall: {title} @ {course} by {created_by} (rid={rid})")
+                        logger.warning(f"Rollcall #{rid} has unknown type. Skipping.")
 
                     await asyncio.sleep(CONFIG["coldDownTime"])
 
             except Exception:
-                logger.exception("An error occurred in the monitoring loop")
+                await ding_talk_markdown("❌AutoSign Failure", f"[AutoSign] ❌ An error occurred in the monitoring loop:\n{traceback.format_exc()}")
+                logger.exception(f"An error occurred in the monitoring loop:\n{traceback.format_exc()}")
                 await asyncio.sleep(5)
 
     finally:
